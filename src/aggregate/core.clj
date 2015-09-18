@@ -1,5 +1,4 @@
 (ns aggregate.core
-  (:refer-clojure :exclude [update])
   (:require [clojure.java.jdbc :as j]
             [clojure.set]
             [honeysql.core :as s]
@@ -136,7 +135,7 @@
   given function. The function should take the key and value pair as
   its input."
   [f m]
-  (reduce (fn [m k] (update-in m [k] #(f k %)))
+  (reduce (fn [m k] (update m k #(f k %)))
           m (keys m)))
 
 (defn- map-match
@@ -161,7 +160,7 @@
     (nil? a) b
     (nil? b) a
     (and (map? a) (map? b))
-    (reduce (fn [a [i bi]] (update-in a [i] #(merge-deep % bi))) a b)
+    (reduce (fn [a [i bi]] (update a i #(merge-deep % bi))) a b)
     (and (coll? a) (= (type a) (type b))) (into a b)
     true b))
 
@@ -422,7 +421,7 @@
                               (from table)))
         row-fn (if (empty? clobs) identity
                    (fn [row]
-                     (reduce (fn [r f] (update-in r [f] #(clob-to-string %)))
+                     (reduce (fn [r f] (update r f #(clob-to-string %)))
                              row clobs)))]
     (fn _read-fn
       [db-spec id-or-fmap]
@@ -617,7 +616,7 @@
             (reduce
              (fn [ents [f {{re :entity :as r} :rel}]]
                (if-not re ents
-                       (update-in ents [re] #(conj (or % #{}) r))))
+                       (update ents re #(conj (or % #{}) r))))
              ents (:fields ecfg)))
           {} er-config)})
 
@@ -674,7 +673,7 @@
   [er-config]
   (reduce
    (fn _blvl-fn [lvl-map [ekw ecfg]]
-     (let [lvl-map (clojure.core/update lvl-map ekw #(or % 1))
+     (let [lvl-map (update lvl-map ekw #(or % 1))
            clvl (inc (ekw lvl-map))]
        (reduce
         (fn [lvl-map [rkw {cekw :child-entity rt :type}]]
@@ -805,7 +804,7 @@
      er-config [{} {}] agg
      :ent-fn (fn [[[avls reqs] ekw iv e]]
                [(reduce (fn [avls {kfn :key-fn :as rel}]
-                          (update-in avls [ekw]
+                          (update avls ekw
                                      #(conj (or % #{})
                                             (kfn e))))
                         avls
@@ -816,7 +815,7 @@
                            rf :field
                            rw :where} :rel}]]
                    (if-let [rv (f e)]
-                     (update-in reqs [re]
+                     (update reqs re
                                 #(conj (or % #{}) (assoc rw rf rv)))
                      reqs))
                  reqs
@@ -843,7 +842,7 @@
                [inds
                 (if-not (#{:m-1 :m-n} rt) reqs
                         (let [cids (if (= rt :m-1) #{r} r)]
-                          (update-in reqs [ckw]
+                          (update reqs ckw
                                      #(clojure.set/union (or % #{}) cids))))])))))
 
 
@@ -910,7 +909,7 @@
              agg (reduce (fn [agg e] (assoc-in agg [entity-kw (:id e)] (dissoc e :id)))
                          agg hes)
              ;;add index to aggregate
-             agg (reduce (fn [agg [k m]] (update-in agg [k] #(merge % m)))
+             agg (reduce (fn [agg [k m]] (update agg k #(merge % m)))
                          agg inds)]
          ;;load the requirement
          (reduce
@@ -953,7 +952,7 @@
                 (let [a (or (avls k) #{})
                       b (or (done k) #{})]
                   (if (and (empty? a) (empty? b)) reqs
-                      (update-in reqs [k] #(clojure.set/difference % a b)))))
+                      (update reqs k #(clojure.set/difference % a b)))))
               reqs (keys reqs))]
          (if (pos? (apply + (map count (vals to-load))))
            (let [agg

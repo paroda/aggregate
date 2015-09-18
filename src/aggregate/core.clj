@@ -46,7 +46,7 @@
 ;;   { :table <table-kw>
 ;;     :head? <is head?> ;; this will be a top level entity in aggregate
 ;;     :family <family-kw> ;; to group together some related entities
-;;     :uid < nil or :id or kw-collection (kw can be field-kw or relation-kw) >
+;;     :uid < :id or kw-collection (kw can be field-kw or relation-kw) >
 ;;     :fields { <field-kw> { :column <column-kw>
 ;;                            :read <read-fn> ;; convert on read from db
 ;;                            :write <write-fn> ;; convert on write to db

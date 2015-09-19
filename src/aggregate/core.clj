@@ -1,8 +1,9 @@
 (ns aggregate.core
   (:require [clojure.java.jdbc :as j]
             [clojure.set]
+            [clojure.pprint]
             [honeysql.core :as s]
-            [honeysql.helpers :refer :all]))
+            [honeysql.helpers :refer :all :exclude [update]]))
 
 ;;--------------------------------------------------------------------
 ;; Aggregate structure
@@ -102,6 +103,12 @@
   "Returns an empty aggregate."
   []
   ^{::id-counter (atom 0)} {})
+
+(defn tempid
+  "Constructs a temporary id for a new entity based on the given reference which can be
+  a number or keyword or even a map."
+  [ref]
+  ^:new {:tid ref})
 
 (defn- dissoc-in
   "Remove the nested key for the given path as a key sequence"
@@ -313,7 +320,7 @@
              (let [[uid agg]
                    (if (= uid-spec :id)
                      [(last iv) (update-in agg iv #(add-meta % {:uid (last iv)}))]
-                     (build-uid ekw iv e agg))
+                     (build-uid er-config ekw iv e agg))
                    piv (drop-last iv)
                    uiv (if (second piv)
                          (let [puiv (get-meta (get-in agg (drop-last piv)) :uiv)]
@@ -463,24 +470,26 @@
         id-col (get-in fields [:id :column])
         _apfn (fn [m row]
                 (merge (if (and (= uid :id)
-                                (get-meta (:id row) :new))
-                         row (dissoc row id-col))
+                                (not (get-meta (:id row) :new)))
+                         row ;; same id only if insisted
+                         (dissoc row id-col)) ;; auto create id in db
                        (or m {})))
         id-sql (first (s/format (-> (select id-col)
                                     (from table)
                                     (where [:= :rowid :?rowid]))))]
     (fn [db-spec entity pim]
-      (let [r (->> (entity-2-row [entity] fields relations) first
-                   (_apfn pim) ;;add parent entity info
-                   (j/insert! db-spec table) first)
-            nid (case (:subprotocol db-spec)
-                  "oracle" (->> r :rowid .stringValue
-                                (#(j/query db-spec [id-sql %]))
-                                first id-col)
-                  (or (get r sikw)
-                      (get r :id)
-                      (throw (Throwable. "Unknown insert result format.
- Do not know how to extract id"))))]
+      (let [row (->> (entity-2-row [entity] fields relations) first
+                   (_apfn pim)) ;;add parent entity info and keep id if applicable
+            res (first (j/insert! db-spec table row))
+            nid (or (id-col row)
+                    (case (:subprotocol db-spec)
+                      "oracle" (->> res :rowid .stringValue
+                                    (#(j/query db-spec [id-sql %]))
+                                    first id-col)
+                      (or (get res sikw)
+                          (get res :id)
+                          (throw (Throwable. "Unknown insert result format.
+ Do not know how to extract id")))))]
         (assoc entity :id nid)))))
 
 
@@ -761,24 +770,6 @@
                               (:relations ecfg)))]
              ecfg))
          er-config)
-        er-config (do ;; validate
-                    (doall
-                     (map (fn [ekw {rels :relations uid :uid}]
-                            (doall
-                             (map (fn [rkw {rt :type ckw :child-entity}]
-                                    (if (and (= rt :1-n) (not uid)
-                                             (get er-config [ckw :uid]))
-                                      (throw (Throwable.
-                                              (str "Error processing " ekw "->" rkw
-                                                   ". No :uid in parent entity but child entity has :uid."))))
-                                    (if (and (= rt :m-1)
-                                             (not (get er-config [ckw :uid])))
-                                      (throw (Throwable.
-                                              (str "Error processing " ekw "->" rkw
-                                                   ". :m-1 relation entity must have :uid spec.")))))
-                                  (filter #(rt? #{:1-n :m-1} %) rels))))
-                          er-config))
-                    er-config)
         shared-ents (shared-entities er-config)
         er-config (add-head-query-sql er-config)
         lvl-map (get-dependency-level er-config)]
@@ -1039,8 +1030,7 @@
                                     (filter (partial rt? [:1-n :m-n])))))
                ;; delete this record
                n (delete-fn db-conn (:id m))
-               n (if n n
-                     #break (do (log m) 0))]
+               n (or n 0)]
            (+ r (or n 0))))))
    0))
 
@@ -1058,8 +1048,8 @@
       (apply
        + (map (fn [ekw]
                 (apply
-                 + (map (fn [[id ent]] (delete-entity! er-config db-conn ent))
-                        (map (fn [[id m]] (assoc m :id id))
+                 + (map (fn [ent] (delete-entity! er-config db-conn ent))
+                        (map (fn [[id ent]] (assoc ent :id id))
                              (get agg ekw)))))
               order)))))
 
@@ -1089,7 +1079,7 @@
   (uiv-2-iv (iv-2-uiv iv agg1) uids2))
 
 
-(defn- register-insert-or-update [er-config changes
+(defn- register-insert-or-update [er-config changes nids
                                   target-uids target-agg
                                   source-uids source-agg uiv]
   ;; register the change: insert or update
@@ -1106,21 +1096,26 @@
         {:keys [ekw iv]} (meta frm)
         tfrm (get-in target-uids uiv)
         ent (get-in source-agg iv)
-        {:keys [fields relations]} (er-config ekw)
+        {:keys [fields relations uid]} (er-config ekw)
 
 
-        [action tfrm tent tiv] ;;obtain target entity (create new if missing)
+        [action tfrm tent tiv nids] ;;obtain target entity (create new if missing)
         (if tfrm
           (let [tiv (get-meta tfrm :iv)] ;;existing entity
-            [nil tfrm (get-in target-agg tiv) tiv])
-          (let [tid (next-id target-agg) ;;new entity insert
+            [nil tfrm (get-in target-agg tiv) tiv nids])
+          (let [id (last iv)             ;;insert new entity
+                tid (if (and (= uid :id)
+                             (not (get-meta id :new)))
+                      id ;; persist id
+                      (next-id target-agg)) ;;dummy id
                 puiv (drop-last 2 uiv)
                 tiv (if (empty? puiv) [ekw tid]
                         (let [tpiv (uiv-2-iv puiv target-uids)]
                           (conj tpiv (last (drop-last iv)) tid)))
                 tfrm ^{:iv tiv :ekw ekw :id tid} {}
-                tent ^{:uiv uiv :uid (last uiv) ::entity ekw} {:id tid}]
-            [:insert tfrm tent tiv]))
+                tent ^{:uiv uiv :uid (last uiv) ::entity ekw} {}
+                nids (if (= id tid) nids (assoc-in nids [ekw id] tid))]
+            [:insert tfrm tent tiv nids]))
 
         cfs (reduce (fn [cfs [f _]]     ;;gather changed fields
                       (let [tv (f tent) v (f ent)]
@@ -1174,7 +1169,7 @@
 
         target-uids (assoc-in target-uids uiv tfrm)
         target-agg (assoc-in target-agg tiv tent)]
-    [changes target-uids target-agg]))
+    [changes nids target-uids target-agg]))
 
 (defn- register-delete [er-config changes target-uids target-agg tuiv tiv]
   ;; delete order
@@ -1213,20 +1208,20 @@
                         (add-meta target-agg {::id-counter (atom 0)}))
 
          ;;first pass: forward order, add from source to target
-         [changes target-uids target-agg]
+         [changes nids target-uids target-agg]
          (walk-uids source-uids
-                    (fn [[changes target-uids target-agg] uiv uid frm]
+                    (fn [[changes nids target-uids target-agg] uiv uid frm]
                       (let [tfrm (get-in target-uids uiv)]
                         (if (or (keyword? uid) ;;skip if not an entity node
                                 (not (editable? (get-meta frm :ekw))) ;;read only
                                 (get-meta tfrm :action)) ;;skip if already processed
                           ;;no-op
-                          [changes target-uids target-agg]
+                          [changes nids target-uids target-agg]
                           ;;k: uid, v: childs {kw {uid {}}
-                          (register-insert-or-update er-config changes
+                          (register-insert-or-update er-config changes nids
                                                      target-uids target-agg
                                                      source-uids source-agg uiv))))
-                    [[] target-uids target-agg] order)
+                    [[] {} target-uids target-agg] order)
 
          ;;second pass: reverse order, delete extras from target
          [changes target-uids target-agg]
@@ -1251,7 +1246,7 @@
                                              target-uids target-agg
                                              uiv (get-meta tfrm :iv))))))
                     [changes target-uids target-agg] (reverse order))]
-    [changes (add-meta target-uids {::agg target-agg})]))
+    [changes nids (add-meta target-uids {::agg target-agg})]))
 
 (defn- uid-2-ufmap
   "Translates the given unique id to a map of unique values that can be used
@@ -1267,15 +1262,22 @@
             uid rel-keys)))
 
 (defn- apply-nids [er-config ekw ent nids]
-  (let [m1s (remove nil? (map (fn [[rkw {rt :type ckw :child-entity}]]
-                                (if (= rt :m-1) [rkw ckw]))
-                              (get-in er-config [ekw :relations])))]
-    (reduce (fn [m [rkw ckw]]
-              (if-let [oid (rkw m)]
-                (if-let [nid (get-in nids [ckw oid])]
-                  (assoc m rkw nid)
-                  m) m))
-            ent m1s)))
+  (reduce (fn [m [rt rkw ckw]]
+            (if-let [nid (case rt
+                           :m-1
+                           (if-let [oid (rkw m)]
+                             (get-in nids [ckw oid]))
+                           :m-n
+                           (if-let [oid (not-empty (rkw m))]
+                             (into #{}
+                                   (map #(if-let [i (get-in nids [ckw %])] i %)
+                                        oid)))
+                           nil)]
+              (assoc m rkw nid)
+              m))
+          ent
+          (map (fn [[rkw {rt :type ckw :child-entity}]] [rt rkw ckw])
+               (get-in er-config [ekw :relations]))))
 
 (defn- apply-db-insert! [er-config db-spec uids agg nids [tiv pniv links]]
   (let [ent (assoc (get-in agg tiv) :id (last tiv))
@@ -1334,18 +1336,23 @@
                                 (ekw uids))))
                     (new-agg)
                     (filter #(-> er-config % :head?) (get-meta er-config ::load-order)))
-            [changes t-uids] (merge-agg er-config uids t-agg)
+            [changes nids t-uids] (merge-agg er-config uids t-agg)
             t-agg (get-meta t-uids ::agg)
 
-            nids
-            (reduce (fn [nids c]
+            t-nids
+            (reduce (fn [t-nids c]
                       (case (first c)
-                        :insert (apply-db-insert! er-config db-conn t-uids t-agg nids (rest c))
-                        :update (apply-db-update! er-config db-conn t-uids t-agg nids (rest c))
+                        :insert (apply-db-insert! er-config db-conn t-uids t-agg t-nids (rest c))
+                        :update (apply-db-update! er-config db-conn t-uids t-agg t-nids (rest c))
                         :delete (do (apply-db-delete! er-config db-conn (rest c))
-                                    nids)
-                        nids))
-                    {} changes)]
-        {:nids nids
-         :agg t-agg
-         :changes changes}))))
+                                    t-nids)
+                        t-nids))
+                    {} changes)
+            nids (reduce (fn [nids [ekw ids]]
+                           (let [t-ids (ekw t-nids)]
+                             (assoc nids ekw
+                                    (into {}
+                                          (map (fn [[oid nid]] [oid (get t-ids nid)])
+                                               ids)))))
+                         nids nids)]
+        {:new-id nids}))))

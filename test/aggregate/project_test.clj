@@ -28,19 +28,19 @@
   {:customer {:table :customer
               :head? true
               :family :gen
-              :uid #{:name}
+              :uid #{:name} ;; set of fields that uniquely identify an entity
               :fields {:id {:column :id}
                        :name {:column :name}}}
    :person {:table :person
             :head? true
             :family :gen
-            :uid #{:name}
+            :uid :name ;; single identifier can be written without the #{}
             :fields {:id {:column :id}
                      :name {:column :name}}}
    :project {:table :project
              :head? true
              :family :gen
-             :uid #{:name}
+             :uid [:name] ;; can use [] instead of #{} as well
              :fields {:id {:column :id}
                       :name {:column :name}}
              :relations {:manager {:type :m-1
@@ -60,7 +60,7 @@
    :task {:table :task
           :head? false
           :family :gen
-          :uid #{:description}
+          :uid :id ;; using the ID itself instead of any unique fields
           :fields {:id {:column :id}
                    :description {:column :description}
                    :effort {:column :effort}}
@@ -79,67 +79,104 @@
 #_ (create-schema! @h2/db-con schema)
 
 
-(def agg {:person {1 {:name "Daisy"}
-                   2 {:name "Mini"}
-                   3 {:name "Mickey"}
-                   4 {:name "Donald"}}
-          :customer {1 {:name "Big Company"}
-                     2 {:name "Startup"}}
-          :project {1 {:name "Java"
-                       :manager 2
-                       :customer 1
-                       :members #{1 2 3}
-                       :tasks {1 {:id 1
-                                  :description "compile"
-                                  :effort 9
-                                  :assignee 3}}}
-                    2 {:name "SQL"
-                       :manager 3
-                       :customer 2
-                       :members #{3 4}
-                       :tasks {2 {:id 2
-                                  :description "deploy"
-                                  :effort 3
-                                  :assignee 4}}}}})
+(def data
+  {:customer {(agg/tempid 1) {:name "Big Company"}
+              (agg/tempid 2) {:name "Startup"}}
+   :person {(agg/tempid :dai) ;; can use keyword too!
+            {:name "Daisy"}
+            (agg/tempid :min) {:name "Mini"}
+            (agg/tempid :mic) {:name "Mickey"}
+            (agg/tempid :don) {:name "Donald"}}
+   :project {(agg/tempid "java") ;; can use strings as well!
+             {:name "Java"
+              :manager (agg/tempid :min)
+              :customer (agg/tempid 1)
+              :members #{(agg/tempid :min)
+                         (agg/tempid :mic)
+                         (agg/tempid :don)}
+              :tasks {1 {:description "compile"
+                         :effort 9
+                         :assignee (agg/tempid :mic)}
+                      2 {:description "deploy"
+                         :effort 5
+                         :assignee (agg/tempid :don)}}}
+             (agg/tempid "sql")
+             {:name "SQL"
+              :manager (agg/tempid :mic)
+              :customer (agg/tempid 2)
+              :members #{(agg/tempid :mic)
+                         (agg/tempid :don)}
+              :tasks {3 {:description "deploy"
+                         :effort 3
+                         :assignee (agg/tempid :don)}
+                      4 {:description "test"
+                         :effort 4
+                         :assignee (agg/tempid :don)}
+                      5 {:description "document"
+                         :effort 7
+                         :assignee (agg/tempid :mic)}}}}})
 
 (deftest project-tests
   (create-schema! @db-con schema)
-  (->> data (map (partial apply agg/save! er @db-con)) doall)
-  (testing "Creating a new project"
-    (let [saved-project (agg/save! er @db-con :project
-                                   {:name "Learning Clojure"
-                                    :customer {:id 1 :name "Big Company"}
-                                    :tasks [{:description "Buy a good book" :effort 1}
-                                            {:description "Install Java" :effort 2}
-                                            {:description "Configure Emacs" :effort 4}]
-                                    :members [{:id 1 :name "Daisy"}
-                                              {:id 2 :name "Mini"}]
-                                    :manager {:id 1 :name "Daisy"}})]
-      (is (= 1 (record-count @db-con :project)))
-      (testing "Assign persons to projects"
-        (->> (agg/load manage-person-to-project-er @db-con :project 1)
-             (#(update-in % [:members] conj {:id 3 :name "Mickey"}))
-             (agg/save! manage-person-to-project-er @db-con)))
-      (testing "Assign person to task"
-        (->> (agg/load manage-task-to-person-er @db-con :task 1)
-             (#(assoc % :assignee {:id 2 :name "Mini"}))
-             (agg/save! manage-task-to-person-er @db-con :task))
-        (let [loaded-project (agg/load er @db-con :project 1) 
-              loaded-daisy (agg/load er @db-con :person 1)
-              loaded-mini (agg/load er @db-con :person 2)]
-          (is (-> loaded-project :customer))
-          (is (= 3 (-> loaded-project :members count)))
-          (is (= 1 (-> loaded-daisy :projects_as_member count)))
-          (is (= 1 (-> loaded-daisy :projects_as_manager count)))
-          (is (= 0 (-> loaded-daisy :tasks count)))
-          (is (= 1 (-> loaded-mini :projects_as_member count)))
-          (is (= 0 (-> loaded-mini :projects_as_manager count)))
-          (is (= 1 (-> loaded-mini :tasks count)))))
-      (testing "Delete a person that a task points to"
-        (is (-> (agg/load manage-task-to-person-er @db-con :task 1) :assignee))
-        (agg/delete! er @db-con (agg/load er @db-con :person 2))
-        (is (nil? (-> (agg/load manage-task-to-person-er @db-con :task 1) :assignee))))
-      (testing "Delete the project"
-        (agg/delete! er @db-con saved-project)))))
+  (testing "Saving aggregate."
+    (let [{nids :new-id} (agg/save-agg! er-config @db-con data)]
+      (testing "Loading from database."
+        (let [a (agg/load-family er-config @db-con :gen)]
+          (testing "Matching with orignial data."
+            (let [expected
+                  {:customer
+                   (into {}
+                         (map (fn [i] [(get-in nids [:customer (agg/tempid i)])
+                                       (get-in data [:customer (agg/tempid i)])])
+                              [1 2]))
+                   :person
+                   (into {}
+                         (map (fn [i] [(get-in nids [:person (agg/tempid i)])
+                                       (get-in data [:person (agg/tempid i)])])
+                              [:dai :mic :min :don]))
+                   :project
+                   (into {}
+                         (map (fn [i]
+                                [(get-in nids [:project (agg/tempid i)])
+                                 (let [{:keys [name manager customer members tasks]}
+                                       (get-in data [:project (agg/tempid i)])]
+                                   {:name name
+                                    :manager (get-in nids [:person manager])
+                                    :customer (get-in nids [:customer customer])
+                                    :members (into #{}
+                                                   (map #(get-in nids [:person %])
+                                                        members))
+                                    :tasks
+                                    (into {}
+                                          (map (fn [[i {a :assignee :as t}]]
+                                                 [i
+                                                  (assoc t :assignee
+                                                         (get-in nids [:person a]))])
+                                               tasks))})])
+                              ["java" "sql"]))}]
+              (is (= a expected))))
+          (testing "Deleting project Java."
+            (let [i (get-in nids [:project (agg/tempid "java")])
+                  p (assoc (get-in a [:project i])
+                           :id i)]
+              (is (= 6 (agg/delete-entity! er-config @db-con p)))))
+          (testing "Deleteing project SQL."
+            (let [i (get-in nids [:project (agg/tempid "sql")])
+                  p (assoc (get-in a [:project i])
+                           :id i)]
+              (is (= 6 (agg/delete-entity! er-config @db-con p)))))
+          (testing "Confirming no projects in database."
+            (let [p (agg/load-head-entity er-config @db-con :project {})]
+              (is (= {} p))))
+          (testing "Checking all persons in database."
+            (let [p (-> (agg/load-head-entity er-config @db-con :person {})
+                        :person vals)]
+              (is (= p [{:name "Daisy"}
+                        {:name "Mini"}
+                        {:name "Mickey"}
+                        {:name "Donald"}]))))
+          (testing "Deleting the rest."
+            (let [n (agg/delete-agg! er-config @db-con a)]
+              (is (= 6 n)))))))))
 
 

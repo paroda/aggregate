@@ -8,6 +8,8 @@ It should allow for renaming the columns to more convinient keywords using a sim
 
 Tested with h2 and oracle database.
 
+Limitation: Currently it doesn't support circular references between entities.
+
 At present, the it is not yet published to clojar. Till then, you can just download it and install to your local repo.
 
 I am yet to provide the API documentation, which is not complete yet. For now, you can try go through the test files for example usage. Primarily this package provides the following public functions that you can use. For more please see the comments included in code.
